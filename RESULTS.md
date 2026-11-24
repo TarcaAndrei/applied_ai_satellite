@@ -82,3 +82,75 @@ The features with the highest gain: NDVI_p10, MNDWI_mean, B02_std, B8A_mean, NDW
 python -m scripts.train_xgb --tune                                 # runs/xgb_b1_all
 python -m scripts.train_xgb --features index --max-depth 4         # runs/xgb_b1_index
 ```
+
+## 2026-11-24 · M2: ResNet-18 from random initialisation (EuroSAT)
+
+**Main result: ResNet-18 trained from random weights on the 12 L2A bands reaches 98.7% test accuracy (macro-F1
+0.987), 4.1 points above XGBoost. Errors fall from 217 to 52 of 4,050. The gain is largest on Highway (F1 0.82 →
+0.98), the class B1 predicted would need spatial layout.**
+
+### Setup
+
+- **Model** (`sat/models.py`). torchvision ResNet-18, `weights=None`, 11.2M parameters. The stem is adapted to
+  64 px patches: conv1 is 3×3, stride 1, with 12 input bands, and the max-pool after it is removed, so the last
+  stage sees 8×8 instead of 2×2.
+- **Input.** The 12 bands that Cluj's L2A images also have (no B10), each standardised with the train-split
+  mean/std (`splits/eurosat_ms_band_stats_seed42.json`). Augmentation: random flips and 90° rotations.
+- **Training** (`scripts/train_cnn.py`). AdamW, weight decay 5e-4, batch 256, 30 epochs, 2 warm-up epochs then
+  cosine decay, bf16 mixed precision, plain cross-entropy (no label smoothing, so the probabilities stay usable
+  for the change-detection thresholds). The epoch with the best val macro-F1 is kept.
+- **Learning rate** chosen on val: 1e-3 (val macro-F1 0.987, best epoch 27) over 3e-4 (0.985, epoch 23). Within
+  noise of each other. About 4.5 minutes in total for both runs on the A100.
+
+### Test results
+
+| Model | Input | Test acc | Macro-F1 |
+|---|---|---|---|
+| B0 majority class | none | 0.111 | 0.020 |
+| B1 XGBoost | 82 spectral features | 0.946 | 0.943 |
+| **M2 ResNet-18, random init** | **12 bands, 64×64** | **0.987** | **0.987** |
+
+Val accuracy is 0.988, test 0.987. Train accuracy at the end is 99.6%, so there is only a small train/val gap.
+
+Test F1 for each class:
+
+| Class | ResNet-18 | XGBoost | Gain |
+|---|---|---|---|
+| **Highway** | **0.981** | **0.822** | **+0.159** |
+| AnnualCrop | 0.982 | 0.932 | +0.050 |
+| Pasture | 0.980 | 0.923 | +0.057 |
+| PermanentCrop | 0.981 | 0.933 | +0.048 |
+| Industrial | 0.989 | 0.946 | +0.043 |
+| River | 0.984 | 0.953 | +0.031 |
+| Residential | 0.996 | 0.969 | +0.027 |
+| HerbaceousVegetation | 0.983 | 0.974 | +0.009 |
+| Forest | 0.996 | 0.990 | +0.006 |
+| SeaLake | 0.994 | 0.990 | +0.004 |
+
+The most frequent test errors (52 in total): HerbaceousVegetation → AnnualCrop (5), River → SeaLake (5),
+AnnualCrop → PermanentCrop (4), Pasture → HerbaceousVegetation (4), Highway → Industrial (3).
+
+### Conclusions
+
+1. **Spatial layout is worth about 4 points on EuroSAT, and it goes where B1 predicted.** The classes that gain
+   most are the ones defined by shape: Highway (+16 F1 points), then the crop/pasture classes (+5) and Industrial
+   (+4). Classes that colour already separates (Forest, SeaLake, HerbaceousVegetation) gain under 1 point.
+2. **The remaining errors are between classes that genuinely look alike**: herbaceous vegetation vs crops, river
+   vs lake, annual vs permanent crops. No single class stands out any more.
+3. **This number is optimistic for the same reason as B1's, probably more so.** With the random split,
+   neighbouring patches of the same scene are in train and test, and a CNN can match their textures directly.
+4. **Prediction to test in Phase 4:** like XGBoost with all features, the CNN sees absolute reflectance
+   (standardised with EuroSAT L1C statistics), so the L1C → L2A shift on Cluj should hurt it. Whether it loses
+   more or less than B1 is one of the gap experiments.
+
+### Caveats
+
+- Single split, single seed. At 98.7% on 4,050 patches the standard error is about ±0.2 points, so the gap to
+  XGBoost (4.1 points) is real, but the 3e-4 vs 1e-3 difference is not.
+- The optional 13-band variant (with B10) has not been run yet: `python -m scripts.train_cnn --bands all`.
+
+### Reproduce
+
+```
+python -m scripts.train_cnn --lr 3e-4 1e-3                         # runs/resnet18_random_l2a12
+```
